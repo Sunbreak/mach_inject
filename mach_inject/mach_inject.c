@@ -27,15 +27,6 @@
 #define ASSERT_CAST( CAST_TO, CAST_FROM ) \
 	COMPILE_TIME_ASSERT( sizeof(CAST_TO)==sizeof(CAST_FROM) )
 
-#if defined(__i386__)
-void* fixedUpImageFromImage (
-		const void *image, 
-		unsigned long imageSize, 
-		unsigned int jumpTableOffset, 
-		unsigned int jumpTableSize,
-		ptrdiff_t fixUpOffset);
-#endif /* __i386__ */
-
 #include <mach/MACH_ERROR.h>
 #define MACH_ERROR(msg, err) { if(err != err_none) mach_error(msg, err); }
 
@@ -78,7 +69,7 @@ mach_inject(
 	mach_port_t	remoteTask = 0;
 	if( !err ) {
 		err = task_for_pid( mach_task_self(), targetProcess, &remoteTask );
-#if defined(__i386__) || defined(__x86_64__)
+#if defined(__x86_64__)
 		if (err == 5) fprintf(stderr, "Could not access task for pid %d. You probably need to add user to procmod group\n", targetProcess);
 #endif
 	}
@@ -103,15 +94,8 @@ mach_inject(
 		err = vm_protect(remoteTask, remoteCode, imageSize, 0, VM_PROT_EXECUTE | VM_PROT_WRITE | VM_PROT_READ);
 	if( !err ) {
 		ASSERT_CAST( pointer_t, image );
-#if defined (__ppc__) || defined (__ppc64__) || defined(__x86_64__)
+#if defined(__x86_64__)
 		err = vm_write( remoteTask, remoteCode, (pointer_t) image, imageSize );
-#elif defined (__i386__)
-		// on x86, jump table use relative jump instructions (jmp), which means
-		// the offset needs to be corrected. We thus copy the image and fix the offset by hand. 
-		ptrdiff_t fixUpOffset = (ptrdiff_t) (image - remoteCode); 
-		void * fixedUpImage = fixedUpImageFromImage(image, imageSize, jumpTableOffset, jumpTableSize, fixUpOffset);
-		err = vm_write( remoteTask, remoteCode, (pointer_t) fixedUpImage, imageSize );
-		free(fixedUpImage);
 #endif
 	}
 	
@@ -145,92 +129,7 @@ mach_inject(
 	
 	//	Allocate the thread.
 	thread_act_t remoteThread;
-#if defined (__ppc__) || defined (__ppc64__)
-	if( !err ) {
-		ppc_thread_state_t remoteThreadState;
-		
-		/** @bug
-			Stack math should be more sophisticated than this (ala redzone).
-		*/
-		remoteStack += stackSize / 2;
-		
-		bzero( &remoteThreadState, sizeof(remoteThreadState) );
-		
-		ASSERT_CAST( unsigned int, remoteCode );
-		remoteThreadState.__srr0 = (unsigned int) remoteCode;
-		remoteThreadState.__srr0 += threadEntryOffset;
-		assert( remoteThreadState.__srr0 < (remoteCode + imageSize) );
-		
-		ASSERT_CAST( unsigned int, remoteStack );
-		remoteThreadState.__r1 = (unsigned int) remoteStack;
-		
-		ASSERT_CAST( unsigned int, imageOffset );
-		remoteThreadState.__r3 = (unsigned int) imageOffset;
-		
-		ASSERT_CAST( unsigned int, remoteParamBlock );
-		remoteThreadState.__r4 = (unsigned int) remoteParamBlock;
-		
-		ASSERT_CAST( unsigned int, paramSize );
-		remoteThreadState.__r5 = (unsigned int) paramSize;
-		
-		ASSERT_CAST( unsigned int, 0xDEADBEEF );
-		remoteThreadState.__lr = (unsigned int) 0xDEADBEEF;
-		
-#if 0
-		printf( "remoteCode start: %p\n", (void*) remoteCode );
-		printf( "remoteCode size: %ld\n", imageSize );
-		printf( "remoteCode pc: %p\n", (void*) remoteThreadState.srr0 );
-		printf( "remoteCode end: %p\n",
-			(void*) (((char*)remoteCode)+imageSize) );
-		fflush(0);
-#endif
-		
-		err = thread_create_running( remoteTask, PPC_THREAD_STATE,
-				(thread_state_t) &remoteThreadState, PPC_THREAD_STATE_COUNT,
-				&remoteThread );
-	}
-#elif defined (__i386__)
-	if( !err ) {
-		
-		i386_thread_state_t remoteThreadState;
-		bzero( &remoteThreadState, sizeof(remoteThreadState) );
-		
-		vm_address_t dummy_thread_struct = remoteStack;
-		remoteStack += (stackSize / 2); // this is the real stack
-		// (*) increase the stack, since we're simulating a CALL instruction, which normally pushes return address on the stack
-		remoteStack -= 4;
-		
-#define PARAM_COUNT 4
-#define STACK_CONTENTS_SIZE ((1+PARAM_COUNT) * sizeof(unsigned int))
-		unsigned int stackContents[1 + PARAM_COUNT]; // 1 for the return address and 1 for each param
-		// first entry is return address (see above *)
-		stackContents[0] = 0xDEADBEEF; // invalid return address.
-		// then we push function parameters one by one.
-		stackContents[1] =  imageOffset;
-		stackContents[2] = remoteParamBlock;
-		stackContents[3] = paramSize;
-		// We use the remote stack we allocated as the fake thread struct. We should probably use a dedicated memory zone. 
-		// We don't fill it with 0, vm_allocate did it for us
-		stackContents[4] = dummy_thread_struct; 
-		
-		// push stackContents
-		err = vm_write( remoteTask, remoteStack,
-						(pointer_t) stackContents, STACK_CONTENTS_SIZE);
-		
-		// set remote Program Counter
-		remoteThreadState.__eip = (unsigned int) (remoteCode);
-		remoteThreadState.__eip += threadEntryOffset;
-		
-		// set remote Stack Pointer
-		ASSERT_CAST( unsigned int, remoteStack );
-		remoteThreadState.__esp = (unsigned int) remoteStack;
-
-		// create thread and launch it
-		err = thread_create_running( remoteTask, i386_THREAD_STATE,
-									 (thread_state_t) &remoteThreadState, i386_THREAD_STATE_COUNT,
-									 &remoteThread );
-	}
-#elif defined(__x86_64__)
+#if defined(__x86_64__)
 	if( !err ) {
 		
 		x86_thread_state64_t remoteThreadState;
@@ -310,9 +209,6 @@ machImageForPointer(
 #if defined(__x86_64__)
 		const struct mach_header_64 *header = (const struct mach_header_64 *)_dyld_get_image_header( imageIndex ); // why no function that returns mach_header_64
 		const struct section_64 *section = getsectbynamefromheader_64( header, SEG_TEXT, SECT_TEXT );
-#else
-		const struct mach_header *header = (const struct mach_header *)_dyld_get_image_header( imageIndex );
-		const struct section *section = getsectbynamefromheader( header, SEG_TEXT, SECT_TEXT );
 #endif
 		if (section == 0) continue;
 		long start = section->addr + _dyld_get_image_vmaddr_slide( imageIndex );
@@ -370,93 +266,9 @@ machImageForPointer(
 				munmap (fileImage, mapSize);
 				close (fd);
 			}
-#if defined(__i386__) // this segment is only available on IA-32
-			if (jumpTableOffset && jumpTableSize) {
-			  const struct section * jumpTableSection = getsectbynamefromheader( header, SEG_IMPORT, "__jump_table" );
-
-			  if (!jumpTableSection) {
-			    unsigned char *start, *end;
-			    jumpTableSection = getsectbynamefromheader( header, SEG_TEXT, "__symbol_stub" );
-			    /*
-			    start = end = (char *) header + jumpTableSection->offset;
-			    end += jumpTableSection->size;
-
-			    fprintf(stderr, "start: %p\n", start);
-			    for (; start < end; start += 6) {
-			      fprintf(stderr, "%p: %p: %p\n",
-				      start,
-				      *(void **)(start+2),
-				      **(void ***)(start+2));
-			    }
-			    */
-			  }
-			  
-			  if (jumpTableSection) {
-			    *jumpTableOffset = jumpTableSection->offset;
-			    *jumpTableSize = jumpTableSection->size;
-			  }
-			}
-#endif
 			return err_none;
 		}
 	}
 	
 	return err_threadEntry_image_not_found;
 }
-
-#if defined(__i386__)
-void* fixedUpImageFromImage (
-		const void *image, 
-		unsigned long imageSize, 
-		unsigned int jumpTableOffset, 
-		unsigned int jumpTableSize, 
-		ptrdiff_t fixUpOffset)
-{
-	// first copy the full image
-	void *fixedUpImage = (void *) malloc ((size_t)imageSize);
-	bcopy(image, fixedUpImage, imageSize);
-	
-	// address of jump table in copied image
-	void *jumpTable = fixedUpImage + jumpTableOffset;
-
-	
-	/* indirect jump table */
-	if (*(unsigned char *) jumpTable == 0xff) {
-	  // each indirect JMP instruction is 6 bytes (FF xx xx xx xx xx) where FF is the opcode for JMP
-	  int jumpTableCount = jumpTableSize / 6;
-	
-	  // skip first "ff xx"
-	  jumpTable += 2;
-	
-	  int entry=0;
-	  for (entry = 0; entry < jumpTableCount; entry++) {
-	    void *jmpValue = *((void **)jumpTable);
-	    /*
-	    fprintf(stderr, "at %p correcting %p to %p\n",
-		    (char *)jumpTable -2,
-		    jmpValue, jmpValue + fixUpOffset);
-	    */
-	    jmpValue -= fixUpOffset;
-	    *((void **)jumpTable) = jmpValue;
-	    jumpTable+=6;
-	  }
-	}
-	else {
-	  // each JMP instruction is 5 bytes (E9 xx xx xx xx) where E9 is the opcode for JMP
-	  int jumpTableCount = jumpTableSize / 5;
-	
-	  // skip first "E9"
-	  jumpTable++;
-	
-	  int entry=0;
-	  for (entry = 0; entry < jumpTableCount; entry++) {
-	    unsigned int jmpValue = *((unsigned int *)jumpTable);
-	    jmpValue += fixUpOffset;
-	    *((unsigned int *)jumpTable) = jmpValue;
-	    jumpTable+=5;
-	  }
-	}
-	
-	return fixedUpImage;
-}
-#endif /* __i386__ */
