@@ -5,6 +5,7 @@
 
 #include	"mach_inject.h"
 
+#include <unistd.h>
 #include <mach-o/dyld.h>
 #include <mach-o/getsect.h>
 #include <mach/mach.h>
